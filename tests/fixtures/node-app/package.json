@@ -1,0 +1,12 @@
+{
+  "name": "node-app-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-test fixture for ci.yml: a dependency-free Node.js project.",
+  "type": "module",
+  "scripts": {
+    "lint": "node --check src/greeting.js && node --check build.js",
+    "test": "node --test",
+    "build": "node build.js"
+  }
+}
