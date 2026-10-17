@@ -1,0 +1,52 @@
+# Shared pipeline from https://github.com/Abbbtle/ci-pipelines; its README lists every input.
+# Builds and tests every change and publishes main to GitHub Pages.
+# One-time setup: Settings > Pages > Source: GitHub Actions.
+
+name: Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, to catch newly published vulnerabilities in code that has not changed.
+    - cron: '30 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: CI
+    uses: Abbbtle/ci-pipelines/.github/workflows/ci.yml@v1
+    with:
+      working-directory: .
+      # On <user>.github.io/<repo>/ the site lives under the repository name. Vite needs that as
+      # its base path; remove this line for a custom domain or a <user>.github.io repository.
+      build-args: --base=/${{ github.event.repository.name }}/
+
+  security:
+    name: Security
+    uses: Abbbtle/ci-pipelines/.github/workflows/security.yml@v1
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  deploy:
+    name: Deploy
+    needs: [ci, security]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    uses: Abbbtle/ci-pipelines/.github/workflows/deploy-pages.yml@v1
+    permissions:
+      pages: write
+      id-token: write
+    with:
+      artifact-name: ${{ needs.ci.outputs.artifact-name }}
+      # Set to true for single-page apps with client-side routing.
+      spa-fallback: false
