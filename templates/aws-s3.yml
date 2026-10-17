@@ -1,0 +1,51 @@
+# Shared pipeline from https://github.com/Abbbtle/ci-pipelines; its README lists every input.
+# Builds and tests every change and deploys dev, uat and main to their own S3 site.
+# One-time setup: create GitHub environments dev, uat and production, each with the variables
+# AWS_DEPLOY_ROLE_ARN, S3_BUCKET and optionally AWS_REGION, CLOUDFRONT_DISTRIBUTION_ID and SITE_URL.
+# See the README for the IAM role's trust policy.
+
+name: Pipeline
+
+on:
+  push:
+    branches: [dev, uat, main]
+  pull_request:
+  schedule:
+    # Weekly, to catch newly published vulnerabilities in code that has not changed.
+    - cron: '30 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: CI
+    uses: Abbbtle/ci-pipelines/.github/workflows/ci.yml@v1
+    with:
+      working-directory: .
+
+  security:
+    name: Security
+    uses: Abbbtle/ci-pipelines/.github/workflows/security.yml@v1
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  deploy:
+    name: Deploy
+    needs: [ci, security]
+    if: >-
+      contains(fromJSON('["dev", "uat", "main"]'), github.ref_name) &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    uses: Abbbtle/ci-pipelines/.github/workflows/deploy-s3.yml@v1
+    permissions:
+      id-token: write
+    with:
+      artifact-name: ${{ needs.ci.outputs.artifact-name }}
+      environment: ${{ github.ref_name == 'main' && 'production' || github.ref_name }}

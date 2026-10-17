@@ -1,0 +1,68 @@
+# Shared pipeline from https://github.com/Abbbtle/ci-pipelines; its README lists every input.
+# Builds and tests every change, deploys pull requests to a Firebase preview channel
+# and publishes main to the live site.
+# One-time setup: add a FIREBASE_SERVICE_ACCOUNT repository secret (firebase init hosting:github).
+
+name: Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, to catch newly published vulnerabilities in code that has not changed.
+    - cron: '30 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    name: CI
+    uses: Abbbtle/ci-pipelines/.github/workflows/ci.yml@v1
+    with:
+      working-directory: .
+
+  security:
+    name: Security
+    uses: Abbbtle/ci-pipelines/.github/workflows/security.yml@v1
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  preview:
+    name: Preview
+    needs: [ci, security]
+    # Pull requests from forks get no secrets, so they are built and tested but not previewed.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    uses: Abbbtle/ci-pipelines/.github/workflows/deploy-firebase.yml@v1
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    with:
+      artifact-name: ${{ needs.ci.outputs.artifact-name }}
+      channel: ''
+    secrets:
+      firebase-service-account: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+
+  deploy:
+    name: Deploy
+    needs: [ci, security]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    uses: Abbbtle/ci-pipelines/.github/workflows/deploy-firebase.yml@v1
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    with:
+      artifact-name: ${{ needs.ci.outputs.artifact-name }}
+      channel: live
+    secrets:
+      firebase-service-account: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
