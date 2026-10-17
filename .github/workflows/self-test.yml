@@ -1,0 +1,164 @@
+name: Self-test
+
+# Runs the reusable workflows against the projects in tests/fixtures, checks what they produce,
+# and on main publishes the Node.js fixture to this repository's GitHub Pages site.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: self-test-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint workflows and scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          file="actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$file" "https://github.com/rhysd/actionlint/releases/download/v$VERSION/$file"
+          echo "$SHA256  $RUNNER_TEMP/$file" | sha256sum --check --quiet -
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP" actionlint
+          echo "$RUNNER_TEMP" >>"$GITHUB_PATH"
+
+      # actionlint also runs shellcheck (preinstalled on the runner) over every run: block.
+      - name: Lint workflows and templates
+        run: actionlint .github/workflows/*.yml templates/*.yml
+
+      - name: Lint scripts
+        run: shellcheck scripts/*.sh
+
+  node:
+    name: Node.js
+    uses: ./.github/workflows/ci.yml
+    with:
+      working-directory: tests/fixtures/node-app
+      artifact-name: node-app
+      postgres-version: '18'
+      build-args: --base=/${{ github.event.repository.name }}/
+      build-env: |
+        # Comments and blank lines are ignored.
+
+        GREETING=hello from build-env
+    secrets:
+      build-secrets: SELF_TEST_SECRET=run-${{ github.run_id }}
+
+  python:
+    name: Python
+    uses: ./.github/workflows/ci.yml
+    with:
+      working-directory: tests/fixtures/python-app
+      artifact-name: python-app
+
+  java:
+    name: Java
+    uses: ./.github/workflows/ci.yml
+    with:
+      working-directory: tests/fixtures/java-app
+      artifact-name: java-app
+
+  static:
+    name: Static site
+    uses: ./.github/workflows/ci.yml
+    with:
+      working-directory: tests/fixtures/static-site/
+      artifact-name: static-site
+
+  check-outputs:
+    name: Check outputs
+    needs: [node, python, java, static]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check the detected stacks
+        env:
+          NODE_STACK: ${{ needs.node.outputs.stack }}
+          PYTHON_STACK: ${{ needs.python.outputs.stack }}
+          JAVA_STACK: ${{ needs.java.outputs.stack }}
+          STATIC_STACK: ${{ needs.static.outputs.stack }}
+          PYTHON_ARTIFACT: ${{ needs.python.outputs.artifact-name }}
+          NODE_ARTIFACT: ${{ needs.node.outputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          expect() {
+            if [ "$2" != "$3" ]; then
+              echo "::error::$1: expected '$3', got '$2'"
+              exit 1
+            fi
+          }
+          expect "Node.js stack" "$NODE_STACK" node
+          expect "Python stack" "$PYTHON_STACK" python
+          expect "Java stack" "$JAVA_STACK" java
+          expect "Static stack" "$STATIC_STACK" static
+          expect "Node.js artifact" "$NODE_ARTIFACT" node-app
+          expect "Python artifact (none)" "$PYTHON_ARTIFACT" ""
+
+      - name: Download the build artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+
+      - name: Check the build artifacts
+        env:
+          BASE: /${{ github.event.repository.name }}/
+        run: |
+          set -euo pipefail
+          find artifacts -type f | sort
+          grep -q "src=\"${BASE}assets/app.js\"" artifacts/node-app/index.html
+          test -f artifacts/node-app/assets/app.js
+          test -f artifacts/java-app/java-app-fixture-1.0.0.jar
+          test -f artifacts/static-site/index.html
+          test ! -e artifacts/python-app
+          echo "All build artifacts look right."
+
+  security:
+    name: Security
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+  pages:
+    name: GitHub Pages
+    needs: [node, check-outputs, security]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/deploy-pages.yml
+    permissions:
+      pages: write
+      id-token: write
+    with:
+      artifact-name: ${{ needs.node.outputs.artifact-name }}
+
+  check-pages:
+    name: Check the published page
+    needs: pages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check that the page's script loads under the base path
+        env:
+          URL: ${{ needs.pages.outputs.url }}
+        run: |
+          set -euo pipefail
+          curl -fsS "$URL" | grep -q 'assets/app.js'
+          curl -fsS -o /dev/null "${URL%/}/assets/app.js"
+          echo "$URL serves the page and its script."

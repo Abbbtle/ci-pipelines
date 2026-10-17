@@ -1,0 +1,35 @@
+name: Release
+
+# Moves the major version tag (v1, v2, ...) to each published vX.Y.Z release, so repositories
+# that call the workflows with @v1 pick up every compatible change.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  move-major-tag:
+    name: Move the major version tag
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Move the tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tags must look like v1.2.3; got '$TAG'."
+            exit 1
+          fi
+          major=${TAG%%.*}
+          git tag --force "$major" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$major"
+          echo "$major now points at $TAG ($GITHUB_SHA)." | tee -a "$GITHUB_STEP_SUMMARY"
