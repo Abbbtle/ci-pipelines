@@ -1,0 +1,483 @@
+name: CI
+
+# Reusable build-and-test job for Node.js (npm), Python, Java (Maven) and plain HTML sites.
+# The stack is detected from the files in `working-directory` unless `stack` is set.
+# The build output is uploaded as an artifact that the deploy workflows publish.
+# See README.md for usage and the full list of inputs.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Folder that holds the project, relative to the repository root.
+        type: string
+        default: .
+      stack:
+        description: auto, node, python, java or static.
+        type: string
+        default: auto
+      node-version:
+        description: Node.js version. Empty reads .nvmrc or .node-version, then falls back to 24.
+        type: string
+        default: ''
+      python-version:
+        description: Python version. Empty reads .python-version, then falls back to 3.14.
+        type: string
+        default: ''
+      java-version:
+        description: Java (Temurin) version.
+        type: string
+        default: '21'
+      scripts:
+        description: npm scripts to run, in order. Scripts the project does not define are skipped.
+        type: string
+        default: format:check lint typecheck test build
+      build-args:
+        description: Space-separated arguments added to `npm run build`, for example --base=/my-repo/.
+        type: string
+        default: ''
+      build-env:
+        description: Non-secret KEY=VALUE lines exported before the checks run.
+        type: string
+        default: ''
+      build-output:
+        description: >-
+          Folder or glob kept as the build artifact, relative to working-directory. Empty picks
+          dist, build or out for Node, target/*.jar for Java and the whole folder for static sites.
+        type: string
+        default: ''
+      artifact-name:
+        description: Name of the uploaded build artifact.
+        type: string
+        default: build
+      postgres-version:
+        description: >-
+          Start a PostgreSQL service of this version; DATABASE_URL and TEST_DATABASE_URL point
+          at it. Empty starts no database.
+        type: string
+        default: ''
+      extra-command:
+        description: Shell command run last, in working-directory, for project-specific checks.
+        type: string
+        default: ''
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-24.04
+      timeout-minutes:
+        type: number
+        default: 20
+    secrets:
+      build-secrets:
+        description: Secret KEY=VALUE lines exported before the checks run. Values are masked in logs.
+        required: false
+    outputs:
+      stack:
+        description: The stack that was built.
+        value: ${{ jobs.build.outputs.stack }}
+      artifact-name:
+        description: Name of the uploaded build artifact, or empty when the project has no build output.
+        value: ${{ jobs.build.outputs.artifact-name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    services:
+      postgres:
+        # An empty image skips the service, so projects without a database start nothing.
+        image: ${{ inputs.postgres-version != '' && format('postgres:{0}', inputs.postgres-version) || '' }}
+        env:
+          # Throwaway CI-only database, not a secret.
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d ci_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      stack: ${{ steps.detect.outputs.stack }}
+      artifact-name: ${{ steps.output.outputs.artifact-name }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect the stack
+        id: detect
+        working-directory: .
+        env:
+          DIR: ${{ inputs.working-directory }}
+          STACK: ${{ inputs.stack }}
+          NODE_VERSION: ${{ inputs.node-version }}
+          PYTHON_VERSION: ${{ inputs.python-version }}
+        run: |
+          set -euo pipefail
+          dir=${DIR%/}
+          dir=${dir#./}
+          if [ -z "$dir" ]; then dir=.; fi
+          if [ ! -d "$dir" ]; then
+            echo "::error::working-directory '$DIR' does not exist in this repository."
+            exit 1
+          fi
+          has_file() {
+            [ -n "$(find "$dir" \( -name .git -o -name node_modules -o -name .venv \) -prune \
+              -o -type f -name "$1" -print -quit)" ]
+          }
+          first_file() {
+            for f in "$@"; do
+              if [ -f "$f" ]; then echo "$f"; return; fi
+            done
+          }
+
+          stack=$STACK
+          if [ "$stack" = auto ]; then
+            if [ -f "$dir/package.json" ]; then stack=node
+            elif [ -f "$dir/pom.xml" ]; then stack=java
+            elif [ -f "$dir/build.gradle" ] || [ -f "$dir/build.gradle.kts" ]; then
+              echo "::error::Gradle projects are not supported yet; only Maven (pom.xml) is."
+              exit 1
+            elif [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ] || [ -f "$dir/setup.py" ] ||
+              has_file '*.py'; then stack=python
+            elif has_file '*.html'; then stack=static
+            else
+              echo "::error::Could not tell what kind of project '$dir' is. Set the stack input to node, python, java or static."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "stack=$stack"
+            echo "dir=$dir"
+          } >>"$GITHUB_OUTPUT"
+
+          case "$stack" in
+            node)
+              if [ -n "$NODE_VERSION" ]; then
+                echo "node-version=$NODE_VERSION" >>"$GITHUB_OUTPUT"
+              else
+                version_file=$(first_file "$dir/.nvmrc" "$dir/.node-version" .nvmrc .node-version)
+                if [ -n "$version_file" ]; then
+                  echo "node-version-file=$version_file" >>"$GITHUB_OUTPUT"
+                else
+                  echo "node-version=24" >>"$GITHUB_OUTPUT"
+                fi
+              fi
+              lockfile=$(first_file "$dir/package-lock.json" "$dir/npm-shrinkwrap.json" package-lock.json)
+              if [ -z "$lockfile" ]; then
+                for other in pnpm-lock.yaml yarn.lock bun.lock bun.lockb; do
+                  if [ -f "$dir/$other" ]; then
+                    echo "::error::Found $other: only npm projects are supported so far."
+                    exit 1
+                  fi
+                done
+              fi
+              echo "lockfile=$lockfile" >>"$GITHUB_OUTPUT"
+              ;;
+            python)
+              if [ -n "$PYTHON_VERSION" ]; then
+                echo "python-version=$PYTHON_VERSION" >>"$GITHUB_OUTPUT"
+              else
+                version_file=$(first_file "$dir/.python-version" .python-version)
+                if [ -n "$version_file" ]; then
+                  echo "python-version-file=$version_file" >>"$GITHUB_OUTPUT"
+                else
+                  echo "python-version=3.14" >>"$GITHUB_OUTPUT"
+                fi
+              fi
+              # pip caching needs at least one dependency file to key on.
+              deps=$(find "$dir" -maxdepth 1 -type f \
+                \( -name 'requirements*.txt' -o -name pyproject.toml -o -name setup.py \) | sort)
+              {
+                echo "pip-cache=${deps:+pip}"
+                echo "pip-deps<<PIP_DEPS_END"
+                echo "$deps"
+                echo "PIP_DEPS_END"
+              } >>"$GITHUB_OUTPUT"
+              ;;
+            java)
+              if [ ! -f "$dir/pom.xml" ]; then
+                echo "::error::stack is java but '$dir' has no pom.xml. Only Maven projects are supported."
+                exit 1
+              fi
+              ;;
+            static) ;;
+            *)
+              echo "::error::Unknown stack '$stack'. Use auto, node, python, java or static."
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "### Build and test"
+            echo
+            echo "Project: \`$dir\` · Stack: **$stack**"
+            echo
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Export build settings
+        env:
+          POSTGRES_VERSION: ${{ inputs.postgres-version }}
+          BUILD_ENV: ${{ inputs.build-env }}
+          BUILD_SECRETS: ${{ secrets.build-secrets }}
+        run: |
+          set -euo pipefail
+          if [ -n "$POSTGRES_VERSION" ]; then
+            url=postgresql://ci:ci@localhost:5432/ci_test
+            {
+              echo "DATABASE_URL=$url"
+              echo "TEST_DATABASE_URL=$url"
+            } >>"$GITHUB_ENV"
+            echo "Exported DATABASE_URL and TEST_DATABASE_URL for PostgreSQL $POSTGRES_VERSION"
+          fi
+          # Writes KEY=VALUE lines to GITHUB_ENV. Lines are never echoed, so secret values stay out of logs.
+          export_lines() {
+            local source=$1 mask=$2 text=$3 line key value
+            while IFS= read -r line || [ -n "$line" ]; do
+              line=${line%$'\r'}
+              case "$line" in '' | '#'*) continue ;; esac
+              key=${line%%=*}
+              value=${line#*=}
+              if [ "$key" = "$line" ] || ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                echo "::error::$source must hold KEY=VALUE lines; one line is not in that form."
+                exit 1
+              fi
+              if [ "$mask" = mask ] && [ -n "$value" ]; then echo "::add-mask::$value"; fi
+              echo "$key=$value" >>"$GITHUB_ENV"
+              echo "Exported $key from $source"
+            done <<<"$text"
+          }
+          export_lines build-env plain "$BUILD_ENV"
+          export_lines build-secrets mask "$BUILD_SECRETS"
+
+      # ---------- Node.js ----------
+      - name: Set up Node.js
+        if: steps.detect.outputs.stack == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ steps.detect.outputs.node-version }}
+          node-version-file: ${{ steps.detect.outputs.node-version-file }}
+          cache: ${{ steps.detect.outputs.lockfile != '' && 'npm' || '' }}
+          cache-dependency-path: ${{ steps.detect.outputs.lockfile }}
+          package-manager-cache: false
+
+      - name: Install dependencies
+        if: steps.detect.outputs.stack == 'node'
+        env:
+          LOCKFILE: ${{ steps.detect.outputs.lockfile }}
+        run: |
+          set -euo pipefail
+          if [ -n "$LOCKFILE" ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "::warning::No package-lock.json found, so dependency versions are not pinned. Commit a lockfile for repeatable builds."
+            npm install --no-audit --no-fund
+          fi
+
+      - name: Run npm scripts
+        if: steps.detect.outputs.stack == 'node'
+        env:
+          SCRIPTS: ${{ inputs.scripts }}
+          BUILD_ARGS: ${{ inputs.build-args }}
+        run: |
+          set -uo pipefail
+          read -r -a build_args <<<"$BUILD_ARGS"
+          failed=()
+          {
+            echo "| npm script | Result |"
+            echo "| --- | --- |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          for script in $SCRIPTS; do
+            body=$(node -e 'const s = (require("./package.json").scripts || {})[process.argv[1]]; if (s) console.log(s)' "$script")
+            # Skip scripts the project lacks, and npm's placeholder "no test specified" test script.
+            if [ -z "$body" ] || [[ "$body" == *"no test specified"* ]]; then
+              echo "Skipping npm run $script: the project does not define it."
+              echo "| \`$script\` | skipped |" >>"$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            args=()
+            if [ "$script" = build ] && [ ${#build_args[@]} -gt 0 ]; then args=(-- "${build_args[@]}"); fi
+            echo "::group::npm run $script ${args[*]}"
+            if npm run "$script" "${args[@]}"; then
+              result=passed
+            else
+              result=failed
+              failed+=("$script")
+            fi
+            echo "::endgroup::"
+            echo "| \`$script\` | $result |" >>"$GITHUB_STEP_SUMMARY"
+          done
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::These npm scripts failed: ${failed[*]}"
+            exit 1
+          fi
+
+      # ---------- Python ----------
+      - name: Set up Python
+        if: steps.detect.outputs.stack == 'python'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ steps.detect.outputs.python-version }}
+          python-version-file: ${{ steps.detect.outputs.python-version-file }}
+          cache: ${{ steps.detect.outputs.pip-cache }}
+          cache-dependency-path: ${{ steps.detect.outputs.pip-deps }}
+
+      - name: Install dependencies
+        if: steps.detect.outputs.stack == 'python'
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip --quiet
+          for file in requirements.txt requirements-dev.txt; do
+            if [ -f "$file" ]; then python -m pip install -r "$file"; fi
+          done
+          if [ -f setup.py ] || { [ -f pyproject.toml ] && grep -q '^\[project\]' pyproject.toml; }; then
+            python -m pip install ".[dev]"
+          fi
+
+      - name: Run Python checks
+        if: steps.detect.outputs.stack == 'python'
+        run: |
+          set -uo pipefail
+          failed=()
+          {
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+          } >>"$GITHUB_STEP_SUMMARY"
+          check() {
+            local name=$1 result
+            shift
+            echo "::group::$name"
+            if "$@"; then result=passed; else result=failed; failed+=("$name"); fi
+            echo "::endgroup::"
+            echo "| $name | $result |" >>"$GITHUB_STEP_SUMMARY"
+          }
+          configured() { [ -f pyproject.toml ] && grep -q "^\[tool\.$1" pyproject.toml; }
+          pytest_tests() {
+            python -m pytest
+            local status=$?
+            # Exit code 5 means pytest collected no tests.
+            if [ "$status" -eq 5 ]; then return 0; fi
+            return "$status"
+          }
+
+          check "Compile" python -m compileall -q -x '(^|/)(\.git|\.venv|venv|node_modules)/' .
+
+          python -m pip install --quiet ruff
+          if [ -f ruff.toml ] || [ -f .ruff.toml ] || configured ruff; then
+            check "Lint (ruff)" ruff check --output-format=github .
+          else
+            # Without a ruff config, only report real errors: syntax errors and undefined names.
+            check "Lint (errors only)" ruff check --output-format=github --select E9,F63,F7,F82 .
+          fi
+
+          if [ -f mypy.ini ] || [ -f .mypy.ini ] || configured mypy; then
+            python -m pip install --quiet mypy
+            check "Typecheck (mypy)" python -m mypy .
+          fi
+
+          if [ -d tests ] || [ -d test ] || [ -n "$(find . \( -name .git -o -name .venv -o -name venv \) -prune \
+            -o -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit)" ]; then
+            if ! python -c 'import pytest' 2>/dev/null; then python -m pip install --quiet pytest; fi
+            check "Tests (pytest)" pytest_tests
+          else
+            echo "| Tests | none found |" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ ${#failed[@]} -gt 0 ]; then
+            echo "::error::These checks failed: ${failed[*]}"
+            exit 1
+          fi
+
+      # ---------- Java (Maven) ----------
+      - name: Set up Java
+        if: steps.detect.outputs.stack == 'java'
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+
+      - name: Build and test with Maven
+        if: steps.detect.outputs.stack == 'java'
+        run: |
+          set -euo pipefail
+          mvn=mvn
+          if [ -x ./mvnw ]; then mvn=./mvnw; fi
+          "$mvn" --batch-mode --no-transfer-progress verify
+          echo "| Maven verify | passed |" >>"$GITHUB_STEP_SUMMARY"
+
+      # ---------- Static sites ----------
+      - name: Check the site
+        if: steps.detect.outputs.stack == 'static'
+        run: |
+          if [ ! -f index.html ]; then
+            echo "::warning::There is no index.html at the top of the site folder, so its address will show a 404 page."
+          fi
+
+      - name: Run extra command
+        if: inputs.extra-command != ''
+        env:
+          EXTRA_COMMAND: ${{ inputs.extra-command }}
+        run: bash -euo pipefail -c "$EXTRA_COMMAND"
+
+      - name: Find the build output
+        id: output
+        env:
+          STACK: ${{ steps.detect.outputs.stack }}
+          DIR: ${{ steps.detect.outputs.dir }}
+          BUILD_OUTPUT: ${{ inputs.build-output }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        run: |
+          set -euo pipefail
+          found=
+          if [ -n "$BUILD_OUTPUT" ]; then
+            if ! compgen -G "$BUILD_OUTPUT" >/dev/null; then
+              echo "::error::build-output '$BUILD_OUTPUT' does not exist after the build."
+              exit 1
+            fi
+            found=$BUILD_OUTPUT
+          else
+            case "$STACK" in
+              node)
+                for candidate in dist build out; do
+                  if [ -d "$candidate" ]; then found=$candidate; break; fi
+                done
+                ;;
+              java) if compgen -G 'target/*.jar' >/dev/null; then found='target/*.jar'; fi ;;
+              static) found=. ;;
+            esac
+          fi
+          if [ -z "$found" ]; then
+            echo "No build output to keep."
+            echo "No build output was kept." >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # upload-artifact resolves paths from the repository root, not working-directory.
+          if [ "$DIR" = . ]; then path=$found; elif [ "$found" = . ]; then path=$DIR; else path=$DIR/$found; fi
+          {
+            echo "path=$path"
+            echo "artifact-name=$ARTIFACT_NAME"
+          } >>"$GITHUB_OUTPUT"
+          echo "Build output \`$path\` kept as artifact **$ARTIFACT_NAME**." >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the build output
+        if: steps.output.outputs.path != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ steps.output.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7

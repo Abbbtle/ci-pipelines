@@ -1,0 +1,111 @@
+name: Deploy to Firebase Hosting
+
+# Reusable deploy of a build artifact (from ci.yml) to Firebase Hosting.
+# channel "live" publishes the site; an empty channel deploys a temporary preview channel
+# for the branch or pull request and comments its address on the pull request.
+# The caller must grant `contents: read`, `checks: write` and `pull-requests: write`,
+# and pass a Firebase service account key as the firebase-service-account secret.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Build artifact to publish, usually needs.ci.outputs.artifact-name.
+        type: string
+        required: true
+      working-directory:
+        description: Folder that holds firebase.json, relative to the repository root.
+        type: string
+        default: .
+      public-dir:
+        description: The folder firebase.json serves (its hosting.public), relative to working-directory.
+        type: string
+        default: dist
+      project-id:
+        description: Firebase project ID. Empty uses the default project in .firebaserc.
+        type: string
+        default: ''
+      channel:
+        description: '"live" for the real site, or empty for a preview channel.'
+        type: string
+        default: live
+      expires:
+        description: How long a preview channel lasts, for example 7d.
+        type: string
+        default: 7d
+      target:
+        description: Hosting target from .firebaserc, for projects with several sites.
+        type: string
+        default: ''
+      environment:
+        description: GitHub environment name. Empty uses "production" for live and "preview" otherwise.
+        type: string
+        default: ''
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-24.04
+    secrets:
+      firebase-service-account:
+        description: JSON key of a service account allowed to deploy to Firebase Hosting.
+        required: true
+    outputs:
+      url:
+        description: Address the site was deployed to.
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    concurrency:
+      group: deploy-firebase-${{ inputs.channel == 'live' && 'live' || github.ref }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment != '' && inputs.environment || (inputs.channel == 'live' && 'production' || 'preview') }}
+      url: ${{ steps.deploy.outputs.details_url }}
+    outputs:
+      url: ${{ steps.deploy.outputs.details_url }}
+    steps:
+      - name: Check there is a build to publish
+        if: inputs.artifact-name == ''
+        run: |
+          echo "::error::artifact-name is empty: the CI job kept no build output. Set its build-output input."
+          exit 1
+
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ inputs.working-directory }}/${{ inputs.public-dir }}
+
+      - name: Deploy
+        id: deploy
+        uses: FirebaseExtended/action-hosting-deploy@500ac625ca2dd40cbd15f7659af953801858032a # v0.11.0
+        with:
+          repoToken: ${{ github.token }}
+          firebaseServiceAccount: ${{ secrets.firebase-service-account }}
+          projectId: ${{ inputs.project-id }}
+          channelId: ${{ inputs.channel }}
+          expires: ${{ inputs.expires }}
+          target: ${{ inputs.target }}
+          entryPoint: ${{ inputs.working-directory }}
+
+      - name: Summarise
+        env:
+          URL: ${{ steps.deploy.outputs.details_url }}
+          EXPIRES: ${{ steps.deploy.outputs.expire_time_formatted }}
+        run: |
+          echo "Deployed to $URL${EXPIRES:+ (preview until $EXPIRES)}" | tee -a "$GITHUB_STEP_SUMMARY"

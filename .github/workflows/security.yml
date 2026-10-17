@@ -1,0 +1,203 @@
+name: Security
+
+# Reusable security checks:
+# - Secret scan: gitleaks over the commits being added (the whole history on other events).
+# - Dependency review: on pull requests, fails when a change adds a dependency with a known
+#   vulnerability at or above `fail-on-severity`.
+# - CodeQL: static analysis whose results appear under the repository's Security tab.
+#
+# The caller must grant `contents: read`, `security-events: write` and `actions: read`.
+
+on:
+  workflow_call:
+    inputs:
+      secret-scan:
+        description: Run the gitleaks secret scan.
+        type: boolean
+        default: true
+      fail-on-severity:
+        description: Lowest advisory severity that fails dependency review (low, moderate, high or critical).
+        type: string
+        default: high
+      codeql-languages:
+        description: >-
+          Comma-separated CodeQL languages, "auto" to pick them from the repository's languages,
+          or "none" to skip CodeQL.
+        type: string
+        default: auto
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-24.04
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secret scan
+    if: inputs.secret-scan
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gitleaks
+        env:
+          VERSION: 8.30.1
+          SHA256_X64: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          SHA256_ARM64: e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) arch=x64 sum=$SHA256_X64 ;;
+            ARM64) arch=arm64 sum=$SHA256_ARM64 ;;
+            *) echo "::error::No gitleaks build is configured for $RUNNER_ARCH runners." && exit 1 ;;
+          esac
+          file="gitleaks_${VERSION}_linux_${arch}.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$file" "https://github.com/gitleaks/gitleaks/releases/download/v$VERSION/$file"
+          echo "$sum  $RUNNER_TEMP/$file" | sha256sum --check --quiet -
+          tar -xzf "$RUNNER_TEMP/$file" -C "$RUNNER_TEMP" gitleaks
+          echo "$RUNNER_TEMP" >>"$GITHUB_PATH"
+
+      - name: Scan for secrets
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          range=
+          if [ "$EVENT" = pull_request ] && [ -n "$PR_BASE" ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = push ] && [ -n "$PUSH_BEFORE" ] && git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+            range="$PUSH_BEFORE..$PUSH_AFTER"
+          fi
+          report="$RUNNER_TEMP/gitleaks.json"
+          args=(git --redact --no-banner --verbose --exit-code 1 --report-format json --report-path "$report")
+          if [ -n "$range" ]; then
+            echo "Scanning commits $range"
+            args+=("--log-opts=$range")
+          else
+            echo "Scanning the whole history"
+          fi
+          gitleaks "${args[@]}" .
+          status=$?
+
+          {
+            echo "### Secret scan"
+            echo
+            if [ "$status" -eq 0 ]; then
+              echo "No secrets found${range:+ in $range}."
+            elif [ -s "$report" ]; then
+              echo "Found $(jq length "$report") possible secret(s). Values are redacted."
+              echo
+              echo "| File | Line | Rule | Commit |"
+              echo "| --- | --- | --- | --- |"
+              jq -r '.[] | "| `\(.File)` | \(.StartLine) | \(.RuleID) | \(.Commit[0:7]) |"' "$report"
+              echo
+              echo "Remove the secret, then rotate it: anything pushed to GitHub should be treated as leaked."
+              echo "A false positive can be listed in \`.gitleaksignore\` by its fingerprint."
+            else
+              echo "gitleaks failed before producing a report; see the step log."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+  dependencies:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Review dependency changes
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: ${{ inputs.fail-on-severity }}
+
+  codeql-languages:
+    name: Pick CodeQL languages
+    if: inputs.codeql-languages != 'none'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      languages: ${{ steps.pick.outputs.languages }}
+    steps:
+      - name: Pick languages
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.codeql-languages }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          languages=()
+          if [ "$REQUESTED" = auto ]; then
+            # GitHub's language statistics for the repository, mapped to CodeQL language names.
+            while IFS= read -r language; do
+              case "$language" in
+                JavaScript | TypeScript | Vue | Svelte) languages+=(javascript-typescript) ;;
+                Python) languages+=(python) ;;
+                Java | Kotlin) languages+=(java-kotlin) ;;
+                Go) languages+=(go) ;;
+                Ruby) languages+=(ruby) ;;
+                C#) languages+=(csharp) ;;
+              esac
+            done < <(gh api "repos/$REPOSITORY/languages" --jq 'keys[]')
+            # The workflows themselves can be analysed for injection and permission problems.
+            languages+=(actions)
+          else
+            IFS=', ' read -r -a languages <<<"$REQUESTED"
+          fi
+          json=$(printf '%s\n' "${languages[@]}" | sed '/^$/d' | sort -u | jq -R . | jq -cs .)
+          echo "CodeQL languages: $json"
+          echo "languages=$json" >>"$GITHUB_OUTPUT"
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    needs: codeql-languages
+    if: needs.codeql-languages.outputs.languages != '[]'
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: ${{ fromJSON(needs.codeql-languages.outputs.languages) }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: ${{ matrix.language }}
+          # Go is the only listed language that needs its build to be observed.
+          build-mode: ${{ matrix.language == 'go' && 'autobuild' || 'none' }}
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: /language:${{ matrix.language }}

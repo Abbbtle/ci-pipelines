@@ -1,0 +1,156 @@
+name: Deploy to S3 and CloudFront
+
+# Reusable deploy of a static build artifact (from ci.yml) to an S3 bucket, optionally
+# behind CloudFront. AWS access uses GitHub OIDC: no AWS keys are stored in GitHub.
+#
+# Each setting can come from an input or from a GitHub variable of the same meaning, so one
+# caller can deploy several stages by setting the variables per environment
+# (Settings > Environments > <name> > Variables):
+#   AWS_DEPLOY_ROLE_ARN, AWS_REGION, S3_BUCKET, CLOUDFRONT_DISTRIBUTION_ID, SITE_URL
+#
+# Because the job runs in a GitHub environment, the role's trust policy must accept the
+# subject repo:<owner>/<repo>:environment:<environment name>.
+# The caller must grant `id-token: write`.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Build artifact to publish, usually needs.ci.outputs.artifact-name.
+        type: string
+        required: true
+      environment:
+        description: GitHub environment to deploy into; its variables fill any settings left empty.
+        type: string
+        default: production
+      role-arn:
+        description: IAM role assumed through GitHub OIDC. Empty uses vars.AWS_DEPLOY_ROLE_ARN.
+        type: string
+        default: ''
+      aws-region:
+        description: Region of the bucket. Empty uses vars.AWS_REGION, then us-east-1.
+        type: string
+        default: ''
+      bucket:
+        description: Bucket name. Empty uses vars.S3_BUCKET.
+        type: string
+        default: ''
+      prefix:
+        description: Key prefix inside the bucket, for sites that share one.
+        type: string
+        default: ''
+      cloudfront-distribution-id:
+        description: Distribution to refresh after upload. Empty uses vars.CLOUDFRONT_DISTRIBUTION_ID, or skips it.
+        type: string
+        default: ''
+      site-url:
+        description: Address checked after the deploy. Empty uses vars.SITE_URL, or skips the check.
+        type: string
+        default: ''
+      immutable-dir:
+        description: >-
+          Folder of fingerprinted files (for example Vite's assets) cached for a year. Everything
+          else is served with no-cache so new deploys show at once. Empty caches nothing long.
+        type: string
+        default: assets
+      runs-on:
+        description: Runner label.
+        type: string
+        default: ubuntu-24.04
+    outputs:
+      url:
+        description: Address of the deployed site, when known.
+        value: ${{ jobs.deploy.outputs.url }}
+
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+    concurrency:
+      group: deploy-s3-${{ inputs.environment }}
+      cancel-in-progress: false
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.site-url != '' && inputs.site-url || vars.SITE_URL }}
+    outputs:
+      url: ${{ inputs.site-url != '' && inputs.site-url || vars.SITE_URL }}
+    env:
+      ROLE_ARN: ${{ inputs.role-arn != '' && inputs.role-arn || vars.AWS_DEPLOY_ROLE_ARN }}
+      AWS_REGION: ${{ inputs.aws-region != '' && inputs.aws-region || (vars.AWS_REGION != '' && vars.AWS_REGION || 'us-east-1') }}
+      BUCKET: ${{ inputs.bucket != '' && inputs.bucket || vars.S3_BUCKET }}
+      PREFIX: ${{ inputs.prefix }}
+      DISTRIBUTION_ID: ${{ inputs.cloudfront-distribution-id != '' && inputs.cloudfront-distribution-id || vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      SITE_URL: ${{ inputs.site-url != '' && inputs.site-url || vars.SITE_URL }}
+      IMMUTABLE_DIR: ${{ inputs.immutable-dir }}
+    steps:
+      - name: Check the settings
+        env:
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+        run: |
+          missing=()
+          if [ -z "$ARTIFACT_NAME" ]; then missing+=("artifact-name (the CI job kept no build output; set its build-output input)"); fi
+          if [ -z "$ROLE_ARN" ]; then missing+=("role-arn (or variable AWS_DEPLOY_ROLE_ARN)"); fi
+          if [ -z "$BUCKET" ]; then missing+=("bucket (or variable S3_BUCKET)"); fi
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf '::error::Missing setting: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Download the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: site
+
+      - name: Sign in to AWS
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          set -euo pipefail
+          prefix=${PREFIX#/}
+          prefix=${prefix%/}
+          destination="s3://$BUCKET${prefix:+/$prefix}"
+          exclude=()
+          if [ -n "$IMMUTABLE_DIR" ] && [ -d "site/$IMMUTABLE_DIR" ]; then
+            # Fingerprinted files go first so new pages never point at files that are not there yet.
+            # Old fingerprinted files are kept for visitors still holding older pages.
+            aws s3 sync "site/$IMMUTABLE_DIR" "$destination/$IMMUTABLE_DIR" --only-show-errors \
+              --cache-control 'public, max-age=31536000, immutable'
+            exclude=(--exclude "$IMMUTABLE_DIR/*")
+          fi
+          aws s3 sync site "$destination" --delete --only-show-errors "${exclude[@]}" \
+            --cache-control 'no-cache'
+          echo "Uploaded to $destination" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Refresh CloudFront
+        if: env.DISTRIBUTION_ID != ''
+        run: |
+          set -euo pipefail
+          prefix=${PREFIX#/}
+          prefix=${prefix%/}
+          id=$(aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
+            --paths "/${prefix:+$prefix/}*" --query 'Invalidation.Id' --output text)
+          aws cloudfront wait invalidation-completed --distribution-id "$DISTRIBUTION_ID" --id "$id"
+
+      - name: Check the live site
+        if: env.SITE_URL != ''
+        run: |
+          for _ in $(seq 1 10); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' "$SITE_URL" || true)
+            if [ "$status" = 200 ]; then
+              echo "Live at $SITE_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 6
+          done
+          echo "::error::$SITE_URL answered $status instead of 200."
+          exit 1
