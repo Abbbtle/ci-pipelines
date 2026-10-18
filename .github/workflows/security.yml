@@ -120,12 +120,39 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Dependency review needs the repository's dependency graph, which can be switched off
+      # (and needs paid Code Security on private repositories). Without it, skip with a warning
+      # rather than fail every pull request.
+      - name: Check that dependency review is available
+        id: available
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          if output=$(gh api "repos/$REPOSITORY/dependency-graph/compare/$BASE...$HEAD" --silent 2>&1); then
+            echo "available=true" >>"$GITHUB_OUTPUT"
+          elif grep -qE 'HTTP (403|404)' <<<"$output"; then
+            message="Dependency review is not available because the dependency graph is off. Turn it on under Settings > Code security > Dependency graph."
+            echo "::warning title=Dependency review skipped::$message"
+            echo "### Dependency review skipped" >>"$GITHUB_STEP_SUMMARY"
+            echo "$message" >>"$GITHUB_STEP_SUMMARY"
+            echo "available=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "::error::Could not reach the dependency graph: $output"
+            exit 1
+          fi
+
       - name: Check out
+        if: steps.available.outputs.available == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Review dependency changes
+        if: steps.available.outputs.available == 'true'
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         with:
           fail-on-severity: ${{ inputs.fail-on-severity }}
@@ -140,29 +167,30 @@ jobs:
     outputs:
       languages: ${{ steps.pick.outputs.languages }}
     steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Pick languages
         id: pick
         env:
-          GH_TOKEN: ${{ github.token }}
           REQUESTED: ${{ inputs.codeql-languages }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           languages=()
           if [ "$REQUESTED" = auto ]; then
-            # GitHub's language statistics for the repository, mapped to CodeQL language names.
-            while IFS= read -r language; do
-              case "$language" in
-                JavaScript | TypeScript | Vue | Svelte) languages+=(javascript-typescript) ;;
-                Python) languages+=(python) ;;
-                Java | Kotlin) languages+=(java-kotlin) ;;
-                Go) languages+=(go) ;;
-                Ruby) languages+=(ruby) ;;
-                C#) languages+=(csharp) ;;
-              esac
-            done < <(gh api "repos/$REPOSITORY/languages" --jq 'keys[]')
-            # The workflows themselves can be analysed for injection and permission problems.
-            languages+=(actions)
+            # Languages of the files being checked, so new code is analysed on its first pull request.
+            files=$(git ls-files)
+            has() { grep -qiE "$1" <<<"$files"; }
+            if has '\.(js|jsx|mjs|cjs|ts|tsx|mts|cts|vue|svelte)$'; then languages+=(javascript-typescript); fi
+            if has '\.py$'; then languages+=(python); fi
+            if has '\.(java|kt|kts)$'; then languages+=(java-kotlin); fi
+            if has '\.go$'; then languages+=(go); fi
+            if has '\.rb$'; then languages+=(ruby); fi
+            if has '\.cs$'; then languages+=(csharp); fi
+            # The workflows themselves are analysed for injection and permission problems.
+            if has '^\.github/workflows/.+\.ya?ml$'; then languages+=(actions); fi
           else
             IFS=', ' read -r -a languages <<<"$REQUESTED"
           fi

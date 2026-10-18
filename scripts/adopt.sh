@@ -49,7 +49,7 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
-[ -n "$repo" ] && [ -n "$template" ] || usage 1
+if [ -z "$repo" ] || [ -z "$template" ]; then usage 1; fi
 template_file="$root/templates/$template.yml"
 if [ ! -f "$template_file" ]; then
   choices=()
@@ -185,6 +185,13 @@ fi
 
 git commit --quiet -m "Add the shared CI/CD pipeline" -m "Builds and tests every change with the reusable workflows from Abbbtle/ci-pipelines, scans for secrets, vulnerable dependencies and code issues, and deploys with the $template template."
 git push --quiet -u origin "$branch"
+
+# Dependency review needs the dependency graph; switching on Dependabot alerts switches it on.
+if gh api -X PUT "repos/$repo/vulnerability-alerts" >/dev/null 2>&1; then
+  echo "Dependabot alerts and the dependency graph are on."
+else
+  echo "warning: could not switch on Dependabot alerts; dependency review is skipped until the dependency graph is on (Settings > Code security)." >&2
+fi
 
 if [ "$template" = github-pages ]; then
   if gh api "repos/$repo/pages" >/dev/null 2>&1; then
