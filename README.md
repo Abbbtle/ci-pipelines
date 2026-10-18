@@ -30,6 +30,7 @@ The quickest way opens a pull request that adds the pipeline:
 ```sh
 scripts/adopt.sh <owner/repo> <template>          # for example: Abbbtle/mini-amazon github-pages
 scripts/adopt.sh <owner/repo> <template> --dry-run   # look first; pushes nothing
+scripts/adopt.sh <owner/repo> firebase --replace firebase-hosting-merge.yml   # retire an old workflow
 ```
 
 The script:

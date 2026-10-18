@@ -9,6 +9,8 @@
 #   --dir <path>      Project folder inside the repository. Default: detected.
 #   --base <branch>   Branch the pull request targets. Default: dev if it exists,
 #                     otherwise the repository's default branch.
+#   --replace <file>  Remove this existing workflow (by file name) because the pipeline
+#                     takes over its job. Repeat for several.
 #   --dry-run         Show the files that would be added; push nothing.
 #   -h, --help        Show this help.
 #
@@ -32,11 +34,13 @@ repo=
 template=
 dir=
 base=
+replace=()
 dry_run=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir) dir=${2:?--dir needs a path}; shift 2 ;;
     --base) base=${2:?--base needs a branch}; shift 2 ;;
+    --replace) replace+=("$(basename "${2:?--replace needs a workflow file name}")"); shift 2 ;;
     --dry-run) dry_run=true; shift ;;
     -h | --help) usage ;;
     -*) die "unknown option $1" ;;
@@ -115,9 +119,8 @@ fi
 echo "Project folder: $dir (${ecosystem:-no package manager})"
 
 [ ! -e .github/workflows/pipeline.yml ] || die "$repo already has .github/workflows/pipeline.yml"
-existing=
-for file in .github/workflows/*.yml .github/workflows/*.yaml; do
-  if [ -f "$file" ]; then existing+="${existing:+, }\`$(basename "$file")\`"; fi
+for file in ${replace[@]+"${replace[@]}"}; do
+  [ -f ".github/workflows/$file" ] || die "$repo has no .github/workflows/$file to replace"
 done
 
 git checkout --quiet -b "$branch"
@@ -140,6 +143,19 @@ if [ "$template" = firebase ]; then
     secret_note="- [ ] Add a \`FIREBASE_SERVICE_ACCOUNT\` repository secret before merging; previews fail without it."
   fi
 fi
+
+# Removed only now, since the Firebase secret lookup above reads the old workflows.
+replaced=
+for file in ${replace[@]+"${replace[@]}"}; do
+  git rm --quiet ".github/workflows/$file"
+  replaced+="${replaced:+, }\`$file\`"
+done
+existing=
+for file in .github/workflows/*.yml .github/workflows/*.yaml; do
+  if [ -f "$file" ] && [ "$file" != .github/workflows/pipeline.yml ]; then
+    existing+="${existing:+, }\`$(basename "$file")\`"
+  fi
+done
 
 added_dependabot=false
 if [ ! -e .github/dependabot.yml ] && [ ! -e .github/dependabot.yaml ]; then
@@ -183,7 +199,7 @@ if $dry_run; then
   exit 0
 fi
 
-git commit --quiet -m "Add the shared CI/CD pipeline" -m "Builds and tests every change with the reusable workflows from Abbbtle/ci-pipelines, scans for secrets, vulnerable dependencies and code issues, and deploys with the $template template."
+git commit --quiet -m "Add the shared CI/CD pipeline" -m "Builds and tests every change with the reusable workflows from Abbbtle/ci-pipelines, scans for secrets, vulnerable dependencies and code issues, and deploys with the $template template.${replaced:+ Removes ${replaced//\`/}, which the pipeline replaces.}"
 git push --quiet -u origin "$branch"
 
 # Dependency review needs the dependency graph; switching on Dependabot alerts switches it on.
@@ -214,6 +230,7 @@ $(case "$template" in
     aws-s3) echo "- **Deploy:** publishes \`dev\`, \`uat\` and \`main\` to their own S3 sites." ;;
   esac)
 $($added_dependabot && echo "- **Dependabot:** weekly minor and patch updates for actions${ecosystem:+ and $ecosystem packages}.")
+$([ -z "$replaced" ] || echo "- **Replaces:** $replaced, whose job the pipeline now does.")
 
 The checks on this pull request are the pipeline's first run.
 $(if [ -n "$existing" ] || [ -n "$secret_note" ]; then
