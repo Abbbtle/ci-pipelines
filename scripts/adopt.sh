@@ -71,10 +71,14 @@ gh repo clone "$repo" "$work/repo" -- --quiet
 cd "$work/repo"
 
 if [ -z "$base" ]; then
+  default_branch=$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name)
+  base=$default_branch
+  # Use dev for a feature -> dev -> main flow, but not a stale dev that is only behind main.
   if git ls-remote --exit-code --heads origin dev >/dev/null; then
-    base=dev
-  else
-    base=$(gh repo view "$repo" --json defaultBranchRef --jq .defaultBranchRef.name)
+    if [ "$(git rev-parse origin/dev)" = "$(git rev-parse "origin/$default_branch")" ] ||
+      ! git merge-base --is-ancestor origin/dev "origin/$default_branch"; then
+      base=dev
+    fi
   fi
 fi
 git checkout --quiet -B "$base" "origin/$base"
@@ -82,11 +86,15 @@ if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
   die "$repo already has a $branch branch; merge or delete it first"
 fi
 
-# The shallowest file with this name, as a folder relative to the repository root.
+# Files with this name, shallowest first.
+by_depth() {
+  find . \( -name .git -o -name node_modules \) -prune -o -type f -name "$1" -print |
+    awk -F/ '{ print NF "\t" $0 }' | sort -n | cut -f2-
+}
+# The folder of the shallowest file with this name.
 shallowest() {
   local file
-  file=$(find . \( -name .git -o -name node_modules \) -prune -o -type f -name "$1" -print |
-    awk -F/ '{ print NF "\t" $0 }' | sort -n | head -1 | cut -f2-)
+  file=$(by_depth "$1" | head -1)
   if [ -n "$file" ]; then dirname "$file"; fi
 }
 if [ -z "$dir" ]; then
@@ -96,7 +104,7 @@ if [ -z "$dir" ]; then
       dir=$(dirname "$file")
       break
     fi
-  done < <(find . -name node_modules -prune -o -type f -name package.json -print | sort)
+  done < <(by_depth package.json)
   for marker in package.json pom.xml pyproject.toml requirements.txt setup.py; do
     if [ -n "$dir" ]; then break; fi
     dir=$(shallowest "$marker")
@@ -116,7 +124,7 @@ if [ -f "$dir/package.json" ]; then ecosystem=npm
 elif [ -f "$dir/pom.xml" ]; then ecosystem=maven
 elif [ -f "$dir/pyproject.toml" ] || [ -f "$dir/requirements.txt" ]; then ecosystem=pip
 fi
-echo "Project folder: $dir (${ecosystem:-no package manager})"
+echo "Project folder: $dir (${ecosystem:-no package manager}); pull request base: $base"
 
 [ ! -e .github/workflows/pipeline.yml ] || die "$repo already has .github/workflows/pipeline.yml"
 for file in ${replace[@]+"${replace[@]}"}; do
@@ -218,17 +226,19 @@ if [ "$template" = github-pages ]; then
   echo "GitHub Pages now publishes from GitHub Actions."
 fi
 
+case "$template" in
+  github-pages) deploy_note="- **Deploy:** publishes \`main\` to GitHub Pages." ;;
+  firebase) deploy_note="- **Deploy:** previews each pull request on a Firebase channel and publishes \`main\` to the live site." ;;
+  aws-s3) deploy_note="- **Deploy:** publishes \`dev\`, \`uat\` and \`main\` to their own S3 sites." ;;
+  *) deploy_note= ;;
+esac
 body=$(
   cat <<EOF
 Adds the shared pipeline from [Abbbtle/ci-pipelines](https://github.com/Abbbtle/ci-pipelines) using the \`$template\` template, for the project in \`$dir\`.
 
 - **CI:** installs dependencies and runs the project's own format, lint, typecheck, test and build steps.
 - **Security:** secret scan of new commits, dependency review on pull requests and CodeQL analysis.
-$(case "$template" in
-    github-pages) echo "- **Deploy:** publishes \`main\` to GitHub Pages." ;;
-    firebase) echo "- **Deploy:** previews each pull request on a Firebase channel and publishes \`main\` to the live site." ;;
-    aws-s3) echo "- **Deploy:** publishes \`dev\`, \`uat\` and \`main\` to their own S3 sites." ;;
-  esac)
+$deploy_note
 $($added_dependabot && echo "- **Dependabot:** weekly minor and patch updates for actions${ecosystem:+ and $ecosystem packages}.")
 $([ -z "$replaced" ] || echo "- **Replaces:** $replaced, whose job the pipeline now does.")
 
