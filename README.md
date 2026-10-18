@@ -101,9 +101,11 @@ The caller grants `contents: read`, `security-events: write` and `actions: read`
   redacted in the log and summary. Treat a real finding as leaked: rotate the secret, then remove
   it. List a false positive in `.gitleaksignore` by the fingerprint the scan prints.
 - **Dependency review:** on pull requests, fails when a change adds a dependency with a known
-  vulnerability at or above `fail-on-severity` (default `high`).
-- **CodeQL:** analyses the languages GitHub detects in the repository (JavaScript/TypeScript,
-  Python, Java/Kotlin, Go, Ruby, C#), plus the workflows themselves. Results appear under
+  vulnerability at or above `fail-on-severity` (default `high`). It needs the repository's
+  dependency graph (**Settings > Code security**). Without the graph, the job warns and skips.
+  `adopt.sh` switches the graph on.
+- **CodeQL:** analyses the languages of the repository's files (JavaScript/TypeScript, Python,
+  Java/Kotlin, Go, Ruby, C#), plus the workflows themselves. Results appear under
   **Security > Code scanning**. If a repository has CodeQL *default setup* switched on, switch it
   off, or set `codeql-languages: none`; the two cannot both upload.
 
